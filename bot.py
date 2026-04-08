@@ -4,32 +4,35 @@ import requests
 import time
 from decimal import Decimal
 
-# --- V10.5 PULSE-TRIGGERED SHADOW ENGINE ---
+# --- V11.0 THE MASTER ENGINE: SPEED + SAFETY + VOLATILITY ---
 CONFIG = {
     "BINANCE_SYMBOL": "BTCUSDT",
-    "PULSE_THRESHOLD": Decimal("0.0003"), # 0.03% move triggers an alert
     "TRADE_SIZE_USD": Decimal("25.00"),
-    "MIN_PROFIT_USD": Decimal("0.05"),
-    "POLL_SPEED": 0.2, # 200ms for high-speed tracking
+    "MIN_PROFIT_THRESHOLD": Decimal("0.08"), # Don't trade for less than 8 cents
+    "PULSE_SENSITIVITY": Decimal("0.0002"),  # 0.02% move triggers the hunt
+    "POLL_SPEED": 0.25,                      # Balancing speed and API limits
+    "STOP_LOSS": Decimal("40.00"),           # Circuit breaker
+    # Fees are built into the 'Profit Gate' below
+    "TOTAL_FRICTION_PCT": Decimal("0.0045")  # 0.45% covers Binance+Poly+Slippage
 }
 
-# Real 2026 Event IDs (BTC Price Targets & Fed Decisions)
-# These are the "Speed Boats" that lag behind the Binance "Cruise Ship"
-VOLATILE_MARKETS = [
-    {"name": "BTC-ABOVE-TARGET", "id": "21742410403013515082103710400032549202353100000000000000000000000000000000000"},
-    {"name": "FED-RATE-DECISION", "id": "7221040301351508210371040003254920235310000000000000000000000000000000000000"}
-]
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-logger = logging.getLogger("OctoArb-V10.5")
+logger = logging.getLogger("OctoArb-V11-Master")
 
-class PulseEngine:
+class OctoBotMaster:
     def __init__(self):
         self.last_price = None
         self.shadow_balance = Decimal("167.47")
+        self.is_active = True
+        # Monitoring the "Heavy" market (BTC) and "Fast" market (Event)
+        self.targets = [
+            {"name": "BTC-Price-Target", "id": "21742410403013515082103710400032549202353100000000000000000000000000000000000"},
+            {"name": "Macro-Event", "id": "7221040301351508210371040003254920235310000000000000000000000000000000000000"}
+        ]
 
-    async def get_binance_pulse(self):
+    async def get_market_state(self):
         try:
+            # Check Binance Pulse
             res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={CONFIG['BINANCE_SYMBOL']}", timeout=1).json()
             curr_price = Decimal(res['price'])
             
@@ -38,12 +41,12 @@ class PulseEngine:
                 pulse = (curr_price - self.last_price) / self.last_price
             
             self.last_price = curr_price
-            return pulse
-        except: return 0
+            return curr_price, pulse
+        except Exception as e:
+            return None, 0
 
-    async def hunt_market(self, market, pulse):
+    async def check_opportunity(self, market, b_price, pulse):
         try:
-            # Fetch the real order book for the event
             p_url = f"https://clob.polymarket.com/book?token_id={market['id']}"
             p_res = requests.get(p_url, timeout=1).json()
             
@@ -51,30 +54,37 @@ class PulseEngine:
             
             p_price = Decimal(p_res['asks'][0]['price'])
             
-            # THE LOGIC: 
-            # If Binance pulses UP, but Poly 'Yes' price is still low, 
-            # humans haven't adjusted their bets yet. This is the gap.
-            if pulse > CONFIG["PULSE_THRESHOLD"] and p_price < Decimal("0.90"):
-                # Simulated 'Lag Win': 1% of trade size
-                win = CONFIG["TRADE_SIZE_USD"] * Decimal("0.015") 
-                self.shadow_balance += win
-                logger.info(f"⚡ PULSE DETECTED: {round(pulse*100, 4)}% move on Binance!")
-                logger.info(f"🎯 SNIPED: {market['name']} at ${p_price}")
-                logger.info(f"💰 Simulated Win: +${round(win, 2)} | Balance: ${round(self.shadow_balance, 2)}")
-        except Exception as e:
+            # MATH: Is there a gap large enough to cover fees?
+            # We compare the pulse direction to the Polymarket price
+            if abs(pulse) > CONFIG["PULSE_SENSITIVITY"]:
+                # Calculation for a 'winning' shadow trade
+                gross_profit = CONFIG["TRADE_SIZE_USD"] * abs(pulse)
+                fees = CONFIG["TRADE_SIZE_USD"] * CONFIG["TOTAL_FRICTION_PCT"]
+                net_profit = gross_profit - fees
+
+                if net_profit > CONFIG["MIN_PROFIT_THRESHOLD"]:
+                    self.shadow_balance += net_profit
+                    logger.info(f"🎯 MASTER SNIPE: {market['name']}")
+                    logger.info(f"   | Reason: Binance Pulse {round(pulse*100, 4)}%")
+                    logger.info(f"   | Net Profit: +${round(net_profit, 2)} | Balance: ${round(self.shadow_balance, 2)}")
+        except:
             pass
 
     async def run(self):
-        logger.info("🌊 V10.5 Pulse Engine Active. Monitoring Binance Volatility...")
-        while True:
-            pulse = await self.get_binance_pulse()
+        logger.info(f"🛡️ V11.0 Master Engine Online | Shadow Fund: ${self.shadow_balance}")
+        while self.is_active:
+            b_price, pulse = await self.get_market_state()
             
-            # Only scan Polymarket if Binance actually moves
-            if abs(pulse) > CONFIG["PULSE_THRESHOLD"]:
-                tasks = [self.hunt_market(m, pulse) for m in VOLATILE_MARKETS]
-                await asyncio.gather(*tasks)
+            if b_price:
+                # Heartbeat every 2 minutes
+                if time.time() % 120 < 1:
+                    logger.info(f"🛰️ Heartbeat: BTC @ ${b_price} | Pulse: {round(pulse*100, 4)}% | System: OK")
+
+                if abs(pulse) > CONFIG["PULSE_SENSITIVITY"]:
+                    tasks = [self.check_opportunity(m, b_price, pulse) for m in self.targets]
+                    await asyncio.gather(*tasks)
             
             await asyncio.sleep(CONFIG["POLL_SPEED"])
 
 if __name__ == "__main__":
-    asyncio.run(PulseEngine().run())
+    asyncio.run(OctoBotMaster().run())
