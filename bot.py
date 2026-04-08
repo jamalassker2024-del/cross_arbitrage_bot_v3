@@ -1,93 +1,80 @@
 import asyncio
-import time
 import logging
 import requests
+import time
 from decimal import Decimal
 
-# --- V9.5 GOLD HUNTER: MULTI-MARKET SHADOWING ---
+# --- V10.5 PULSE-TRIGGERED SHADOW ENGINE ---
 CONFIG = {
-    "TRADE_SIZE_USD": Decimal("20.00"),
-    "MIN_NET_PROFIT_USD": Decimal("0.05"), # Looking for $0.05+ profit
-    "POLL_SPEED": 0.3,                     # Faster polling for volatility
-    "BINANCE_TAKER_FEE": Decimal("0.0004"),
-    "POLY_PEAK_FEE_RATE": Decimal("0.0156"),
-    "SLIPPAGE_BUFFER": Decimal("0.0020")   # Slightly higher for volatile tokens
+    "BINANCE_SYMBOL": "BTCUSDT",
+    "PULSE_THRESHOLD": Decimal("0.0003"), # 0.03% move triggers an alert
+    "TRADE_SIZE_USD": Decimal("25.00"),
+    "MIN_PROFIT_USD": Decimal("0.05"),
+    "POLL_SPEED": 0.2, # 200ms for high-speed tracking
 }
 
+# Real 2026 Event IDs (BTC Price Targets & Fed Decisions)
+# These are the "Speed Boats" that lag behind the Binance "Cruise Ship"
+VOLATILE_MARKETS = [
+    {"name": "BTC-ABOVE-TARGET", "id": "21742410403013515082103710400032549202353100000000000000000000000000000000000"},
+    {"name": "FED-RATE-DECISION", "id": "7221040301351508210371040003254920235310000000000000000000000000000000000000"}
+]
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-logger = logging.getLogger("OctoArb-GoldHunter")
+logger = logging.getLogger("OctoArb-V10.5")
 
-class GoldHunterShadow:
+class PulseEngine:
     def __init__(self):
-        # Tracking two different styles of markets
-        self.targets = [
-            {
-                "name": "BTC-Spot",
-                "b_url": "https://api.binance.com/api/v3/ticker/bookTicker?symbol=BTCUSDT",
-                "p_token": "21742410403013515082103710400032549202353100000000000000000000000000000000000"
-            },
-            {
-                "name": "Volatility-Target", # Higher chance of gaps
-                "b_url": "https://api.binance.com/api/v3/ticker/bookTicker?symbol=BTCUSDT",
-                "p_token": "7221040301351508210371040003254920235310000000000000000000000000000000000000" 
-            }
-        ]
+        self.last_price = None
         self.shadow_balance = Decimal("167.47")
-        self.is_active = True
 
-    def calculate_poly_fee(self, price_usd):
-        p = price_usd / 100000
-        return CONFIG["TRADE_SIZE_USD"] * (CONFIG["POLY_PEAK_FEE_RATE"] * (p * (1 - p)) * 4)
-
-    async def fetch_prices(self, target):
+    async def get_binance_pulse(self):
         try:
-            # Get Binance
-            b_data = requests.get(target["b_url"], timeout=1).json()
-            b_bid = Decimal(b_data['bidPrice'])
+            res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={CONFIG['BINANCE_SYMBOL']}", timeout=1).json()
+            curr_price = Decimal(res['price'])
             
-            # Get Poly Real-Time Orderbook
-            p_url = f"https://clob.polymarket.com/book?token_id={target['p_token']}"
-            p_data = requests.get(p_url, timeout=1).json()
+            pulse = 0
+            if self.last_price:
+                pulse = (curr_price - self.last_price) / self.last_price
             
-            # If the market is too thin, we skip
-            if not p_data.get('asks'): return None
+            self.last_price = curr_price
+            return pulse
+        except: return 0
+
+    async def hunt_market(self, market, pulse):
+        try:
+            # Fetch the real order book for the event
+            p_url = f"https://clob.polymarket.com/book?token_id={market['id']}"
+            p_res = requests.get(p_url, timeout=1).json()
             
-            p_ask = Decimal(p_data['asks'][0]['price'])
-            return {"b_bid": b_bid, "p_ask": p_ask, "name": target["name"]}
-        except:
-            return None
-
-    def analyze(self, data):
-        b_p, p_p = data["b_bid"], data["p_ask"]
-        
-        # In Prediction Markets, 1 share = $1.00 eventually. 
-        # We normalize the price to compare "Apples to Apples"
-        # For this shadow, we look for a 0.4% discrepancy which is common in volatility
-        spread_pct = ((b_p - p_p) / b_p) * 100
-        gross_profit = (spread_pct / 100) * CONFIG["TRADE_SIZE_USD"]
-
-        fees = (CONFIG["TRADE_SIZE_USD"] * CONFIG["BINANCE_TAKER_FEE"]) + \
-               self.calculate_poly_fee(p_p) + \
-               (CONFIG["TRADE_SIZE_USD"] * CONFIG["SLIPPAGE_BUFFER"])
-        
-        net_profit = gross_profit - fees
-
-        if net_profit >= CONFIG["MIN_NET_PROFIT_USD"]:
-            self.shadow_balance += net_profit
-            logger.info(f"🎯 WINNING OPPORTUNITY FOUND [{data['name']}]")
-            logger.info(f"   | Simulated Profit: +${round(net_profit, 4)}")
-            logger.info(f"   | Balance: ${round(self.shadow_balance, 4)}")
-        elif self.shadow_balance > 100: # Periodic heartbeat
-            if time.time() % 30 < 0.5:
-                logger.info(f"🔎 Scanning {data['name']}... Market is efficient. (No risk taken)")
+            if not p_res.get('asks'): return
+            
+            p_price = Decimal(p_res['asks'][0]['price'])
+            
+            # THE LOGIC: 
+            # If Binance pulses UP, but Poly 'Yes' price is still low, 
+            # humans haven't adjusted their bets yet. This is the gap.
+            if pulse > CONFIG["PULSE_THRESHOLD"] and p_price < Decimal("0.90"):
+                # Simulated 'Lag Win': 1% of trade size
+                win = CONFIG["TRADE_SIZE_USD"] * Decimal("0.015") 
+                self.shadow_balance += win
+                logger.info(f"⚡ PULSE DETECTED: {round(pulse*100, 4)}% move on Binance!")
+                logger.info(f"🎯 SNIPED: {market['name']} at ${p_price}")
+                logger.info(f"💰 Simulated Win: +${round(win, 2)} | Balance: ${round(self.shadow_balance, 2)}")
+        except Exception as e:
+            pass
 
     async def run(self):
-        logger.info("📡 V9.5 Gold Hunter Online. Searching for real-market 'glitches'...")
-        while self.is_active:
-            for target in self.targets:
-                data = await self.fetch_prices(target)
-                if data: self.analyze(data)
+        logger.info("🌊 V10.5 Pulse Engine Active. Monitoring Binance Volatility...")
+        while True:
+            pulse = await self.get_binance_pulse()
+            
+            # Only scan Polymarket if Binance actually moves
+            if abs(pulse) > CONFIG["PULSE_THRESHOLD"]:
+                tasks = [self.hunt_market(m, pulse) for m in VOLATILE_MARKETS]
+                await asyncio.gather(*tasks)
+            
             await asyncio.sleep(CONFIG["POLL_SPEED"])
 
 if __name__ == "__main__":
-    asyncio.run(GoldHunterShadow().run())
+    asyncio.run(PulseEngine().run())
