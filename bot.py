@@ -1,84 +1,74 @@
 import asyncio
-import logging
-import requests
-import feedparser  # New: Reads news without an API key
+import json
+import websockets
 from decimal import Decimal
+import time
 
-# --- V12.2 THE GHOST ENGINE: KEYLESS NEWS + MASTER BOT ---
+# --- INSTITUTIONAL CONFIG ---
 CONFIG = {
-    "BINANCE_SYMBOL": "BTCUSDT",
-    "TRADE_SIZE_USD": Decimal("2.00"),
-    "PULSE_SENSITIVITY": Decimal("0.00025"),
-    "POLL_SPEED": 0.25,
-    "NEWS_FEEDS": [
-        "https://cointelegraph.com/rss",
-        "https://www.coindesk.com/arc/outboundfeeds/rss/",
-        "https://cryptopanic.com/news/rss/" # Their RSS is usually still free
-    ]
+    "SYMBOL": "btcusdt",
+    "BINANCE_FEE": Decimal("0.001"), # 0.1% Taker
+    "BYBIT_FEE": Decimal("0.001"),   # 0.1% Taker
+    "MIN_SPREAD_THRESHOLD": Decimal("0.0035"), # 0.35% (Covers fees + slippage)
+    "SLIPPAGE_PROTECTION": Decimal("0.0005"),  # 0.05% safety buffer
 }
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-logger = logging.getLogger("OctoGhost-V12.2")
-
-class GhostEngine:
+class LeadLagArb:
     def __init__(self):
-        self.last_price = None
-        self.shadow_balance = Decimal("10")
-        self.news_multiplier = Decimal("1.0")
-        self.hot_keywords = ["BREAKING", "CRASH", "SEC", "LIQUIDATION", "PUMP", "SURGE"]
+        self.prices = {"binance": Decimal("0"), "bybit": Decimal("0")}
+        self.balance = Decimal("2000.00") # $1000 on each exchange
 
-    # --- TASK 1: KEYLESS NEWS SCANNER ---
-    async def scan_news(self):
-        """Scans public RSS feeds for market-moving words"""
+    async def stream_binance(self):
+        url = f"wss://stream.binance.com:9443/ws/{CONFIG['SYMBOL']}@ticker"
+        async with websockets.connect(url) as ws:
+            while True:
+                data = json.loads(await ws.recv())
+                self.prices["binance"] = Decimal(data['a']) # Best Ask
+
+    async def stream_bybit(self):
+        # Using public Bybit websocket
+        url = "wss://stream.bybit.com/v5/public/spot"
+        async with websockets.connect(url) as ws:
+            await ws.send(json.dumps({"op": "subscribe", "args": [f"tickers.{CONFIG['SYMBOL'].upper()}"]}))
+            while True:
+                data = json.loads(await ws.recv())
+                if 'data' in data:
+                    self.prices["bybit"] = Decimal(data['data']['ask1P'])
+
+    async def trade_engine(self):
+        print("⚔️ ARBITRAGE ENGINE ONLINE | Monitoring Lead-Lag...")
         while True:
-            try:
-                found_heat = False
-                for url in CONFIG["NEWS_FEEDS"]:
-                    feed = feedparser.parse(url)
-                    # Check the 3 latest headlines in each feed
-                    for entry in feed.entries[:3]:
-                        title = entry.title.upper()
-                        if any(word in title for word in self.hot_keywords):
-                            found_heat = True
-                            break
-                
-                if found_heat:
-                    self.news_multiplier = Decimal("2.0") # Double sensitivity
-                    logger.info("📡 GHOST NEWS: Hot headlines detected. Increasing Bot Agility.")
-                else:
-                    self.news_multiplier = Decimal("1.0")
-            except:
-                pass
-            await asyncio.sleep(45) # Check news every 45 seconds
+            b_p = self.prices["binance"]
+            by_p = self.prices["bybit"]
 
-    # --- TASK 2: BINANCE PULSE ---
-    async def get_pulse(self):
-        try:
-            res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={CONFIG['BINANCE_SYMBOL']}", timeout=1).json()
-            curr = Decimal(res['price'])
-            pulse = (curr - self.last_price) / self.last_price if self.last_price else 0
-            self.last_price = curr
-            return pulse
-        except: return 0
+            if b_p > 0 and by_p > 0:
+                # Calculate Raw Spread
+                # If Binance (Leader) jumps, Bybit (Laggard) is still cheap
+                spread = (b_p - by_p) / by_p
+                
+                # TOTAL COST = (Binance Fee + Bybit Fee + Slippage Buffer)
+                total_costs = CONFIG["BINANCE_FEE"] + CONFIG["BYBIT_FEE"] + CONFIG["SLIPPAGE_PROTECTION"]
+
+                if spread > CONFIG["MIN_SPREAD_THRESHOLD"]:
+                    net_profit = spread - total_costs
+                    profit_usd = (Decimal("100.0") * net_profit)
+                    
+                    print(f"\n🚀 ARB OPPORTUNITY FOUND!")
+                    print(f"LDR (Binance): {b_p} | LAG (Bybit): {by_p}")
+                    print(f"Spread: {round(spread*100, 3)}% | NET: ${round(profit_usd, 2)}")
+                    
+                    self.balance += profit_usd
+                    # Cooldown to let laggard catch up
+                    await asyncio.sleep(2)
+
+            await asyncio.sleep(0.01) # 10ms check loop
 
     async def run(self):
-        logger.info(f"👻 V12.2 Ghost Engine Online | Balance: ${self.shadow_balance}")
-        asyncio.create_task(self.scan_news()) # Start News in background
-        
-        while True:
-            pulse = await self.get_pulse()
-            
-            # Smart logic: Pulse * News Heat
-            effective_pulse = abs(pulse) * self.news_multiplier
-            
-            if effective_pulse > CONFIG["PULSE_SENSITIVITY"]:
-                # If news is hot (2.0), the bot 'snipes' much smaller price moves
-                win = CONFIG["TRADE_SIZE_USD"] * Decimal("0.012")
-                self.shadow_balance += win
-                logger.info(f"🎯 NEWS-BACKED SNIPE! Pulse: {round(pulse*100,4)}% | Multiplier: {self.news_multiplier}x")
-                logger.info(f"💰 New Balance: ${round(self.shadow_balance, 2)}")
-            
-            await asyncio.sleep(CONFIG["POLL_SPEED"])
+        await asyncio.gather(
+            self.stream_binance(),
+            self.stream_bybit(),
+            self.trade_engine()
+        )
 
 if __name__ == "__main__":
-    asyncio.run(GhostEngine().run())
+    asyncio.run(LeadLagArb().run())
