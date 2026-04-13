@@ -9,20 +9,19 @@ getcontext().prec = 12
 
 # ========== CONFIGURATION ==========
 CONFIG = {
-    "SYMBOLS": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
-    "BINANCE_FEE": Decimal("0.001"),
+    "SYMBOLS": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "PEPEUSDT", "DOGEUSDT", "SUIUSDT"],
+    "BINANCE_FEE": Decimal("0.001"),          # 0.1% taker fee
     "BYBIT_FEE": Decimal("0.001"),
-    "MARKET_ORDER_THRESHOLD": Decimal("0.0035"),   # 0.35% spread -> market order
-    "LIMIT_ORDER_THRESHOLD": Decimal("0.0025"),    # 0.25% spread -> limit order
-    "ORDER_SIZE_USDT": Decimal("100"),
-    "SLIPPAGE_MARKET": Decimal("0.0005"),          # 0.05% slippage for market orders
+    "MARKET_ORDER_THRESHOLD": Decimal("0.0020"),   # 0.20% spread -> market order
+    "LIMIT_ORDER_THRESHOLD": Decimal("0.0015"),    # 0.15% spread -> limit order
+    "ORDER_SIZE_USDT": Decimal("50"),              # smaller size for more frequent trades
+    "SLIPPAGE_MARKET": Decimal("0.0005"),          # 0.05% slippage
     "MAX_LIMIT_WAIT_SEC": 5,
     "LATENCY_MS": 150,
 }
 
 class RealArbitrageExecutor:
     def __init__(self):
-        # Real-time prices
         self.prices = {s: {"binance_ask": Decimal("0"), "binance_bid": Decimal("0"),
                            "bybit_ask": Decimal("0"), "bybit_bid": Decimal("0")}
                        for s in CONFIG["SYMBOLS"]}
@@ -36,7 +35,7 @@ class RealArbitrageExecutor:
         self.last_log = 0
         self.running = True
 
-    # ---------- WebSocket feeds (robust) ----------
+    # ---------- WebSocket feeds ----------
     async def stream_binance(self):
         while self.running:
             try:
@@ -60,7 +59,6 @@ class RealArbitrageExecutor:
             try:
                 url = "wss://stream.bybit.com/v5/public/spot"
                 async with websockets.connect(url) as ws:
-                    # Subscribe to tickers for all symbols
                     subscribe_msg = {
                         "op": "subscribe",
                         "args": [f"tickers.{s}" for s in CONFIG["SYMBOLS"]]
@@ -69,13 +67,11 @@ class RealArbitrageExecutor:
                     while self.running:
                         msg = await ws.recv()
                         data = json.loads(msg)
-                        # Bybit sends subscription success messages first, then real tickers
                         if 'topic' in data and data['topic'].startswith('tickers.'):
                             d = data.get('data', {})
                             if isinstance(d, dict):
                                 symbol = d.get('symbol')
                                 if symbol in self.prices:
-                                    # Use .get() with fallback to existing value
                                     ask = d.get('ask1Price')
                                     bid = d.get('bid1Price')
                                     if ask is not None:
@@ -120,7 +116,7 @@ class RealArbitrageExecutor:
             self.stats["winning_trades"] += 1
         self.stats["total_profit_usdt"] += net_profit
         win_rate = (self.stats["winning_trades"] / self.stats["total_trades"] * 100) if self.stats["total_trades"] else 0
-        print(f"\n🔥 MARKET ARBITRAGE {symbol} | Profit: ${net_profit:.2f} | WinRate: {win_rate:.1f}%")
+        print(f"\n🔥 MARKET ARBITRAGE {symbol} | Profit: ${net_profit:.4f} | WinRate: {win_rate:.1f}%")
         return net_profit
 
     async def place_limit_arbitrage(self, symbol, buy_exch, sell_exch, buy_price, sell_price):
@@ -136,7 +132,7 @@ class RealArbitrageExecutor:
             "timestamp": time.time()
         }
         self.open_limit_orders.append(order)
-        print(f"📌 LIMIT ORDER PLACED {symbol} | Buy {buy_exch}@{buy_price} | Sell {sell_exch}@{sell_price}")
+        print(f"📌 LIMIT ORDER PLACED {symbol} | Buy {buy_exch}@{buy_price:.8f} | Sell {sell_exch}@{sell_price:.8f}")
 
     async def check_limit_orders(self):
         """Monitor open limit orders – close when sell limit becomes fillable."""
@@ -162,7 +158,7 @@ class RealArbitrageExecutor:
                     self.stats["winning_trades"] += 1
                 self.stats["total_profit_usdt"] += net_profit
                 win_rate = (self.stats["winning_trades"] / self.stats["total_trades"] * 100) if self.stats["total_trades"] else 0
-                print(f"\n✅ LIMIT FILLED {sym} | Profit: ${net_profit:.2f} | WinRate: {win_rate:.1f}%")
+                print(f"\n✅ LIMIT FILLED {sym} | Profit: ${net_profit:.4f} | WinRate: {win_rate:.1f}%")
                 continue
             elif time.time() - order["timestamp"] > CONFIG["MAX_LIMIT_WAIT_SEC"]:
                 print(f"⌛ LIMIT EXPIRED {sym} – no fill within {CONFIG['MAX_LIMIT_WAIT_SEC']}s")
@@ -190,6 +186,10 @@ class RealArbitrageExecutor:
                 buy_price, sell_price = by_ask, b_bid
 
             gross_spread = (sell_price - buy_price) / buy_price
+            # Optional: print spreads for debugging (remove in production)
+            if gross_spread > Decimal("0.0005"):
+                print(f"🔍 {sym} spread: {float(gross_spread)*100:.3f}%", end=" | ")
+
             if gross_spread >= CONFIG["MARKET_ORDER_THRESHOLD"]:
                 await self.execute_market_arbitrage(sym, buy_exch, sell_exch, buy_price, sell_price)
             elif gross_spread >= CONFIG["LIMIT_ORDER_THRESHOLD"]:
@@ -208,7 +208,7 @@ class RealArbitrageExecutor:
             now = time.time()
             if now - self.last_log > 15:
                 win_rate = (self.stats["winning_trades"] / self.stats["total_trades"] * 100) if self.stats["total_trades"] else 0
-                print(f"\n📊 STATS | Trades: {self.stats['total_trades']} | Wins: {self.stats['winning_trades']} | WinRate: {win_rate:.1f}% | Net Profit: ${self.stats['total_profit_usdt']:.2f} | Fees: ${self.stats['total_fees_paid']:.2f}")
+                print(f"\n📊 STATS | Trades: {self.stats['total_trades']} | Wins: {self.stats['winning_trades']} | WinRate: {win_rate:.1f}% | Net Profit: ${self.stats['total_profit_usdt']:.4f} | Fees: ${self.stats['total_fees_paid']:.4f}")
                 self.last_log = now
             await asyncio.sleep(0.05)
 
