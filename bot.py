@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-OPTIMIZED PROFITABLE LIMIT BOT – $0.50/DAY TARGET
-- TP: 0.05% (achievable in seconds)
-- SL: 0.03% (tight loss control)
-- Position size: $1.00 per trade
-- Higher trade frequency for $0.50/day target
+FIXED PROFITABLE BOT – WIDER STOP LOSS + CONFIRMATION
+- TP: 0.08% (bigger profit per win)
+- SL: 0.12% (wider to avoid noise)
+- Entry confirmation: require OFI to stay strong for 2 consecutive reads
+- Max hold: 60 seconds
 """
 
 import asyncio
@@ -15,27 +15,29 @@ import websockets
 import aiohttp
 from decimal import Decimal, getcontext
 import time
+from collections import deque
 
 getcontext().prec = 12
 
 CONFIG = {
     "SYMBOLS": ["BTCUSDT", "ETHUSDT", "DOGEUSDT", "SOLUSDT", "PEPEUSDT", "SUIUSDT"],
-    "ORDER_SIZE_USDT": Decimal("1.00"),          # Increased to $1.00 for better profit
+    "ORDER_SIZE_USDT": Decimal("1.00"),
     "INITIAL_BALANCE": Decimal("20.00"),
     "OFI_LEVELS": 8,
-    "OFI_THRESHOLD": Decimal("0.50"),            # Lowered for more trades
-    "TAKE_PROFIT_BPS": Decimal("5"),             # 0.05% (achievable!)
-    "STOP_LOSS_BPS": Decimal("3"),               # 0.03% tight stop
-    "MAX_HOLD_SECONDS": 45,                      # More time to hit TP
-    "WIN_COOLDOWN_SEC": 1,
-    "LOSS_COOLDOWN_SEC": 30,
+    "OFI_THRESHOLD": Decimal("0.65"),
+    "OFI_CONFIRMATIONS": 2,                    # Require 2 consecutive strong readings
+    "TAKE_PROFIT_BPS": Decimal("8"),           # 0.08% (bigger profit)
+    "STOP_LOSS_BPS": Decimal("12"),            # 0.12% (wider to avoid noise)
+    "MAX_HOLD_SECONDS": 60,                    # More time to hit TP
+    "WIN_COOLDOWN_SEC": 2,
+    "LOSS_COOLDOWN_SEC": 45,
     "SCAN_INTERVAL_MS": 100,
     "REFRESH_BOOK_SEC": 30,
     "BINANCE_WS": "wss://stream.binance.com:9443/ws",
 }
 
 MAKER_FEE = Decimal("0")
-TAKER_FEE = Decimal("0.001")  # 0.1% for emergency exits only
+TAKER_FEE = Decimal("0.001")
 
 class OrderBook:
     def __init__(self, symbol):
@@ -43,6 +45,7 @@ class OrderBook:
         self.bids = {}
         self.asks = {}
         self.last_update = 0.0
+        self.ofi_history = deque(maxlen=10)
 
     def apply_depth(self, data):
         for side, key in [('bids', 'b'), ('asks', 'a')]:
@@ -72,7 +75,19 @@ class OrderBook:
         ask_vol = sum(q for _, q in sorted_asks)
         if bid_vol + ask_vol == 0:
             return Decimal('0')
-        return (bid_vol - ask_vol) / (bid_vol + ask_vol)
+        ofi = (bid_vol - ask_vol) / (bid_vol + ask_vol)
+        self.ofi_history.append(ofi)
+        return ofi
+
+    def is_signal_confirmed(self, threshold):
+        """Require last N OFI readings to all exceed threshold"""
+        if len(self.ofi_history) < CONFIG["OFI_CONFIRMATIONS"]:
+            return False, 0
+        recent = list(self.ofi_history)[-CONFIG["OFI_CONFIRMATIONS"]:]
+        if all(abs(o) > threshold for o in recent):
+            direction = 1 if recent[-1] > 0 else -1
+            return True, direction
+        return False, 0
 
     async def refresh_snapshot(self, session):
         url = f"https://api.binance.com/api/v3/depth?symbol={self.symbol}&limit=20"
@@ -86,7 +101,7 @@ class OrderBook:
         except Exception:
             return False
 
-class OptimizedProfitBot:
+class FixedProfitBot:
     def __init__(self):
         self.order_books = {s: OrderBook(s) for s in CONFIG["SYMBOLS"]}
         self.positions = {}
@@ -97,6 +112,7 @@ class OptimizedProfitBot:
         self.daily_start = time.time()
         self.last_trade_time = {}
         self.last_trade_result = {}
+        self.entry_pending = {}  # Track symbols waiting for confirmation
         self.running = True
 
     async def load_snapshots(self, session):
@@ -138,7 +154,6 @@ class OptimizedProfitBot:
         
         self.balance -= (cost + fee)
         
-        # Target and stop prices (using limit orders for both)
         if side == 'buy':
             target_price = price * (Decimal("1") + CONFIG["TAKE_PROFIT_BPS"] / Decimal("10000"))
             stop_price = price * (Decimal("1") - CONFIG["STOP_LOSS_BPS"] / Decimal("10000"))
@@ -154,19 +169,11 @@ class OptimizedProfitBot:
             'order_size': order_size,
             'target_price': target_price,
             'stop_price': stop_price,
-            'exit_placed': False,
         }
         
         expected_profit = order_size * (CONFIG["TAKE_PROFIT_BPS"] / Decimal("10000"))
         print(f"📈 {symbol} {side.upper()} @ {price:.4f} | ${order_size:.2f} | Target: +${expected_profit:.5f}")
         return True
-
-    def place_exit_order(self, symbol):
-        pos = self.positions.get(symbol)
-        if not pos or pos.get('exit_placed'):
-            return
-        pos['exit_placed'] = True
-        # Exit limit order placed at target price (0% fee)
 
     def check_positions(self, symbol):
         pos = self.positions.get(symbol)
@@ -176,7 +183,6 @@ class OptimizedProfitBot:
         book = self.order_books[symbol]
         now = time.time()
         
-        # Check if target reached (use bid/ask appropriately)
         if pos['side'] == 'buy':
             current = book.best_bid()
             if current >= pos['target_price']:
@@ -194,18 +200,16 @@ class OptimizedProfitBot:
                 self.close_loss(symbol, current, "SL")
                 return
         
-        # Timeout check
         if now - pos['entry_time'] > CONFIG["MAX_HOLD_SECONDS"]:
             self.close_loss(symbol, current, "TIMEOUT")
 
     def close_win(self, symbol, exit_price):
-        """Close winning trade with limit exit (0% fee)"""
         pos = self.positions.pop(symbol, None)
         if not pos:
             return
         
         gross = pos['quantity'] * exit_price
-        fee = gross * MAKER_FEE  # 0%
+        fee = gross * MAKER_FEE
         cost_basis = pos['quantity'] * pos['entry_price']
         profit = (gross - cost_basis) - fee
         
@@ -221,7 +225,6 @@ class OptimizedProfitBot:
         self.last_trade_time[symbol] = time.time()
 
     def close_loss(self, symbol, exit_price, reason):
-        """Close losing trade with market exit (0.1% fee)"""
         pos = self.positions.pop(symbol, None)
         if not pos:
             return
@@ -248,9 +251,9 @@ class OptimizedProfitBot:
         for sym in CONFIG["SYMBOLS"]:
             asyncio.create_task(self.subscribe_depth(sym))
         
-        print("\n🚀 OPTIMIZED PROFIT BOT – TARGET $0.50/DAY")
-        print(f"   Size: ${CONFIG['ORDER_SIZE_USDT']} | TP: 0.05% | SL: 0.03%")
-        print(f"   Loss cooldown: {CONFIG['LOSS_COOLDOWN_SEC']}s\n")
+        print("\n🚀 FIXED PROFIT BOT – WIDER SL + CONFIRMATION")
+        print(f"   Size: ${CONFIG['ORDER_SIZE_USDT']} | TP: 0.08% | SL: 0.12%")
+        print(f"   Confirmations: {CONFIG['OFI_CONFIRMATIONS']} | Loss cooldown: {CONFIG['LOSS_COOLDOWN_SEC']}s\n")
         
         last_hb = 0
         last_ofi_debug = 0
@@ -279,10 +282,8 @@ class OptimizedProfitBot:
                 # Check positions
                 for sym in list(self.positions.keys()):
                     self.check_positions(sym)
-                    if sym in self.positions:
-                        self.place_exit_order(sym)
                 
-                # Open new positions
+                # Open new positions with confirmation
                 if self.balance >= Decimal("0.20"):
                     for sym in CONFIG["SYMBOLS"]:
                         if sym in self.positions:
@@ -292,14 +293,16 @@ class OptimizedProfitBot:
                         if sym in self.last_trade_time and now - self.last_trade_time[sym] < cooldown:
                             continue
                         
-                        ofi = self.order_books[sym].get_ofi(CONFIG["OFI_LEVELS"])
+                        book = self.order_books[sym]
+                        confirmed, direction = book.is_signal_confirmed(CONFIG["OFI_THRESHOLD"])
                         
-                        if ofi > CONFIG["OFI_THRESHOLD"]:
-                            print(f"⚡ {sym} OFI: {ofi:.3f} → BUY")
-                            self.open_position(sym, 'buy')
-                        elif ofi < -CONFIG["OFI_THRESHOLD"]:
-                            print(f"⚡ {sym} OFI: {ofi:.3f} → SELL")
-                            self.open_position(sym, 'sell')
+                        if confirmed:
+                            if direction == 1:
+                                print(f"⚡ {sym} OFI CONFIRMED → BUY")
+                                self.open_position(sym, 'buy')
+                            else:
+                                print(f"⚡ {sym} OFI CONFIRMED → SELL")
+                                self.open_position(sym, 'sell')
                 
                 # Daily summary
                 if now - self.daily_start >= 86400:
@@ -316,7 +319,7 @@ class OptimizedProfitBot:
                 await asyncio.sleep(CONFIG["SCAN_INTERVAL_MS"] / 1000.0)
 
 if __name__ == "__main__":
-    bot = OptimizedProfitBot()
+    bot = FixedProfitBot()
     try:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
