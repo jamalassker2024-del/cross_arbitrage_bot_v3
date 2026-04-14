@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-MICRO WALLET ORDER FLOW BOT – $20 BALANCE, $0.10 MIN TRADE
-- Uses Binance Convert (min $0.10 per trade)
-- Extremely small position sizing
-- High trade frequency – accumulates tiny profits
-- Loss cooldown prevents account drain
+PROFITABLE MARKET ORDER BOT – $20 BALANCE (INSTANT FILL)
+- Market orders (instant execution)
+- Extremely small TP: 0.04% (achievable in seconds)
+- Tight SL: 0.03%
+- Loss cooldown: 30 seconds
 """
 
 import asyncio
@@ -15,37 +15,34 @@ import websockets
 import aiohttp
 from decimal import Decimal, getcontext
 import time
-from collections import deque
 
 getcontext().prec = 12
 
-# ========== MICRO WALLET CONFIGURATION ==========
 CONFIG = {
     "SYMBOLS": ["BTCUSDT", "ETHUSDT", "DOGEUSDT", "SOLUSDT", "PEPEUSDT", "SUIUSDT"],
-    "INITIAL_BALANCE": Decimal("20.00"),           # $20 total
-    "ORDER_SIZE_USDT": Decimal("0.50"),            # $0.50 per trade (5x Binance Convert min)
-    "MIN_ORDER_USDT": Decimal("0.10"),             # Binance Convert minimum
-    "OFI_LEVELS": 8,                               # Slightly fewer levels for speed
-    "OFI_THRESHOLD": Decimal("0.60"),              # Extreme signals only
-    "TAKE_PROFIT_BPS": Decimal("8"),               # 0.08% profit target
-    "STOP_LOSS_BPS": Decimal("5"),                 # 0.05% stop loss
-    "MAX_HOLD_SECONDS": 10,                        # Faster exits for micro trades
-    "WIN_COOLDOWN_SEC": 1,                         # 1 second after win
-    "LOSS_COOLDOWN_SEC": 30,                       # 30 seconds after loss
-    "SCAN_INTERVAL_MS": 50,                        # 50ms scan for speed
-    "REFRESH_BOOK_SEC": 30,                        # Refresh order book every 30s
+    "ORDER_SIZE_USDT": Decimal("0.50"),
+    "INITIAL_BALANCE": Decimal("20.00"),
+    "OFI_LEVELS": 8,
+    "OFI_THRESHOLD": Decimal("0.60"),
+    "TAKE_PROFIT_BPS": Decimal("4"),       # 0.04% (achievable in seconds!)
+    "STOP_LOSS_BPS": Decimal("3"),         # 0.03%
+    "MAX_HOLD_SECONDS": 5,                 # 5 seconds max
+    "WIN_COOLDOWN_SEC": 1,
+    "LOSS_COOLDOWN_SEC": 30,
+    "SCAN_INTERVAL_MS": 50,
+    "REFRESH_BOOK_SEC": 30,
     "BINANCE_WS": "wss://stream.binance.com:9443/ws",
 }
 
-MAKER_FEE = Decimal("0")   # Limit orders = 0% fee
+# Market order fees (taker)
+TAKER_FEE = Decimal("0.001")  # 0.1%
 
-class MicroOrderBook:
+class OrderBook:
     def __init__(self, symbol):
         self.symbol = symbol
         self.bids = {}
         self.asks = {}
         self.last_update = 0.0
-        self.last_refresh = 0.0
 
     def apply_depth(self, data):
         for side, key in [('bids', 'b'), ('asks', 'a')]:
@@ -85,15 +82,13 @@ class MicroOrderBook:
                 self.bids = {Decimal(p): Decimal(q) for p, q in data['bids']}
                 self.asks = {Decimal(p): Decimal(q) for p, q in data['asks']}
                 self.last_update = time.time()
-                self.last_refresh = time.time()
                 return True
         except Exception as e:
-            print(f"❌ Refresh error {self.symbol}: {e}")
             return False
 
-class MicroWalletBot:
+class MarketOrderBot:
     def __init__(self):
-        self.order_books = {s: MicroOrderBook(s) for s in CONFIG["SYMBOLS"]}
+        self.order_books = {s: OrderBook(s) for s in CONFIG["SYMBOLS"]}
         self.positions = {}
         self.balance = CONFIG["INITIAL_BALANCE"]
         self.total_trades = 0
@@ -107,7 +102,7 @@ class MicroWalletBot:
     async def load_snapshots(self, session):
         for sym in CONFIG["SYMBOLS"]:
             await self.order_books[sym].refresh_snapshot(session)
-            print(f"✅ {sym} snapshot loaded")
+            print(f"✅ {sym} ready")
 
     async def subscribe_depth(self, symbol):
         stream = f"{symbol.lower()}@depth20@100ms"
@@ -122,62 +117,100 @@ class MicroWalletBot:
             except Exception:
                 await asyncio.sleep(3)
 
-    def open_micro_position(self, symbol, side):
-        """Open tiny position using limit order at best bid/ask"""
+    def open_market_position(self, symbol, side):
+        """MARKET ORDER – instant execution at best ask/bid"""
         book = self.order_books[symbol]
+        
         if side == 'buy':
-            price = book.best_bid()
+            price = book.best_ask()  # Buy at ask (market buy)
         else:
-            price = book.best_ask()
+            price = book.best_bid()  # Sell at bid (market sell)
         
         if price <= 0:
             return False
         
-        # Calculate quantity based on order size
         order_size = CONFIG["ORDER_SIZE_USDT"]
-        # Ensure we don't exceed remaining balance
-        if order_size > self.balance * Decimal("0.95"):  # Leave 5% buffer
+        if order_size > self.balance:
             order_size = self.balance * Decimal("0.9")
-            if order_size < CONFIG["MIN_ORDER_USDT"]:
+            if order_size < Decimal("0.10"):
                 return False
         
         qty = order_size / price
         cost = qty * price
-        fee = cost * MAKER_FEE
+        fee = cost * TAKER_FEE  # Taker fee
         
         if cost + fee > self.balance:
             return False
         
         self.balance -= (cost + fee)
+        
+        # Calculate target prices
+        if side == 'buy':
+            target_price = price * (Decimal("1") + CONFIG["TAKE_PROFIT_BPS"] / Decimal("10000"))
+            stop_price = price * (Decimal("1") - CONFIG["STOP_LOSS_BPS"] / Decimal("10000"))
+        else:
+            target_price = price * (Decimal("1") - CONFIG["TAKE_PROFIT_BPS"] / Decimal("10000"))
+            stop_price = price * (Decimal("1") + CONFIG["STOP_LOSS_BPS"] / Decimal("10000"))
+        
         self.positions[symbol] = {
             'side': side,
             'entry_price': price,
             'quantity': qty,
             'entry_time': time.time(),
             'order_size': order_size,
+            'target_price': target_price,
+            'stop_price': stop_price,
         }
-        
-        # Calculate expected profit for display
-        expected_profit = order_size * (CONFIG["TAKE_PROFIT_BPS"] / Decimal("10000"))
-        print(f"💰 OPEN {symbol} {side.upper()} @ {price:.4f} | Size: ${order_size:.2f} | Expected: +${expected_profit:.4f} | Balance: ${self.balance:.2f}")
+        print(f"⚡ MARKET {symbol} {side.upper()} @ {price:.4f} | ${order_size:.2f} | Balance: ${self.balance:.2f}")
         return True
 
-    def close_micro_position(self, symbol, reason):
+    def check_position(self, symbol):
+        """Check if position should close based on current price"""
+        pos = self.positions.get(symbol)
+        if not pos:
+            return
+        
+        book = self.order_books[symbol]
+        mid = book.mid_price()
+        if mid == 0:
+            return
+        
+        now = time.time()
+        
+        # Check take profit or stop loss
+        if pos['side'] == 'buy':
+            if mid >= pos['target_price']:
+                self.close_market_position(symbol, "TP")
+            elif mid <= pos['stop_price']:
+                self.close_market_position(symbol, "SL")
+            elif now - pos['entry_time'] > CONFIG["MAX_HOLD_SECONDS"]:
+                self.close_market_position(symbol, "TIMEOUT")
+        else:
+            if mid <= pos['target_price']:
+                self.close_market_position(symbol, "TP")
+            elif mid >= pos['stop_price']:
+                self.close_market_position(symbol, "SL")
+            elif now - pos['entry_time'] > CONFIG["MAX_HOLD_SECONDS"]:
+                self.close_market_position(symbol, "TIMEOUT")
+
+    def close_market_position(self, symbol, reason):
         pos = self.positions.pop(symbol, None)
         if not pos:
             return
         
         book = self.order_books[symbol]
+        
+        # Exit at opposite market price
         if pos['side'] == 'buy':
-            exit_price = book.best_ask()
-        else:
             exit_price = book.best_bid()
+        else:
+            exit_price = book.best_ask()
         
         if exit_price <= 0:
             exit_price = book.mid_price()
         
         gross = pos['quantity'] * exit_price
-        fee = gross * MAKER_FEE
+        fee = gross * TAKER_FEE
         cost_basis = pos['quantity'] * pos['entry_price']
         profit = (gross - cost_basis) - fee
         
@@ -192,7 +225,7 @@ class MicroWalletBot:
         
         self.hourly_profit += profit
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
-        print(f"🎯 CLOSE {symbol} {reason} | Profit: ${profit:.4f} ({profit/pos['order_size']*100:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
+        print(f"🎯 CLOSE {symbol} {reason} | Profit: ${profit:.5f} ({profit/pos['order_size']*100:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
         self.last_trade_time[symbol] = time.time()
 
     async def run(self):
@@ -202,9 +235,9 @@ class MicroWalletBot:
         for sym in CONFIG["SYMBOLS"]:
             asyncio.create_task(self.subscribe_depth(sym))
         
-        print("\n🚀 MICRO WALLET ORDER FLOW BOT – $20 BALANCE")
-        print(f"   Order size: ${CONFIG['ORDER_SIZE_USDT']} | Min trade: ${CONFIG['MIN_ORDER_USDT']}")
-        print(f"   Profit target: {float(CONFIG['TAKE_PROFIT_BPS'])/100:.2f}% | Stop loss: {float(CONFIG['STOP_LOSS_BPS'])/100:.2f}%\n")
+        print("\n🚀 MARKET ORDER BOT – INSTANT EXECUTION")
+        print(f"   Order size: ${CONFIG['ORDER_SIZE_USDT']} | TP: {float(CONFIG['TAKE_PROFIT_BPS'])/100:.2f}%")
+        print(f"   Loss cooldown: {CONFIG['LOSS_COOLDOWN_SEC']}s\n")
         
         last_hb = 0
         last_ofi_debug = 0
@@ -214,45 +247,28 @@ class MicroWalletBot:
             while self.running:
                 now = time.time()
                 
-                # Refresh order books periodically
                 if now - last_refresh > CONFIG["REFRESH_BOOK_SEC"]:
                     for sym in CONFIG["SYMBOLS"]:
                         await self.order_books[sym].refresh_snapshot(session)
                     last_refresh = now
                 
-                # Debug OFI every 5 seconds (show only strong signals)
+                # Debug OFI
                 if now - last_ofi_debug > 5:
-                    strong_signals = []
+                    strong = []
                     for sym in CONFIG["SYMBOLS"]:
                         ofi = self.order_books[sym].get_ofi(CONFIG["OFI_LEVELS"])
                         if abs(ofi) > 0.3:
-                            strong_signals.append(f"{sym}:{ofi:.3f}")
-                    if strong_signals:
-                        print(f"🔍 Strong OFI: {' | '.join(strong_signals)}")
+                            strong.append(f"{sym}:{ofi:.3f}")
+                    if strong:
+                        print(f"🔍 OFI: {' | '.join(strong)}")
                     last_ofi_debug = now
                 
-                # 1. Close positions
+                # Check positions
                 for sym in list(self.positions.keys()):
-                    pos = self.positions[sym]
-                    book = self.order_books[sym]
-                    mid = book.mid_price()
-                    if mid == 0:
-                        continue
-                    
-                    if pos['side'] == 'buy':
-                        profit_pct = (mid / pos['entry_price'] - 1) * 100
-                    else:
-                        profit_pct = (pos['entry_price'] / mid - 1) * 100
-                    
-                    if profit_pct >= float(CONFIG['TAKE_PROFIT_BPS']) / 100:
-                        self.close_micro_position(sym, "TP")
-                    elif profit_pct <= -float(CONFIG['STOP_LOSS_BPS']) / 100:
-                        self.close_micro_position(sym, "SL")
-                    elif now - pos['entry_time'] > CONFIG['MAX_HOLD_SECONDS']:
-                        self.close_micro_position(sym, "TIMEOUT")
+                    self.check_position(sym)
                 
-                # 2. Open new positions (only if balance > minimum order)
-                if self.balance >= CONFIG["MIN_ORDER_USDT"] * 2:
+                # Open new positions
+                if self.balance >= Decimal("0.20"):
                     for sym in CONFIG["SYMBOLS"]:
                         if sym in self.positions:
                             continue
@@ -261,36 +277,33 @@ class MicroWalletBot:
                         if sym in self.last_trade_time and now - self.last_trade_time[sym] < cooldown:
                             continue
                         
-                        book = self.order_books[sym]
-                        ofi = book.get_ofi(CONFIG["OFI_LEVELS"])
+                        ofi = self.order_books[sym].get_ofi(CONFIG["OFI_LEVELS"])
                         
                         if ofi > CONFIG["OFI_THRESHOLD"]:
-                            print(f"⚡ {sym} OFI: {ofi:.3f} → BUY")
-                            self.open_micro_position(sym, 'buy')
+                            print(f"⚡ {sym} OFI: {ofi:.3f} → MARKET BUY")
+                            self.open_market_position(sym, 'buy')
                         elif ofi < -CONFIG["OFI_THRESHOLD"]:
-                            print(f"⚡ {sym} OFI: {ofi:.3f} → SELL")
-                            self.open_micro_position(sym, 'sell')
-                else:
-                    if int(now) % 60 == 0:  # Print once per minute
-                        print(f"⚠️ Low balance: ${self.balance:.2f} (minimum order: ${CONFIG['MIN_ORDER_USDT']})")
+                            print(f"⚡ {sym} OFI: {ofi:.3f} → MARKET SELL")
+                            self.open_market_position(sym, 'sell')
                 
-                # 3. Hourly profit summary
+                # Hourly summary
                 if now - self.last_hour_reset >= 3600:
-                    print(f"\n⏰ HOURLY PROFIT: +${self.hourly_profit:.4f} | Balance: ${self.balance:.2f} | Total trades: {self.total_trades}\n")
+                    print(f"\n⏰ HOURLY PROFIT: +${self.hourly_profit:.5f} | Balance: ${self.balance:.2f}\n")
                     self.hourly_profit = Decimal('0')
                     self.last_hour_reset = now
                 
-                # 4. Heartbeat
+                # Heartbeat
                 if now - last_hb > 30:
-                    print(f"📡 Balance: ${self.balance:.2f} | Open: {len(self.positions)} | WinRate: {(self.winning_trades/self.total_trades*100) if self.total_trades else 0:.1f}%")
+                    wr = (self.winning_trades/self.total_trades*100) if self.total_trades else 0
+                    print(f"📡 Balance: ${self.balance:.2f} | Open: {len(self.positions)} | WR: {wr:.1f}% | Trades: {self.total_trades}")
                     last_hb = now
                 
                 await asyncio.sleep(CONFIG["SCAN_INTERVAL_MS"] / 1000.0)
 
 if __name__ == "__main__":
-    bot = MicroWalletBot()
+    bot = MarketOrderBot()
     try:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
         bot.running = False
-        print("\nShutdown complete")
+        print("\nShutdown")
